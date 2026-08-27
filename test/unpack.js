@@ -3905,3 +3905,237 @@ t.test('no linking through a symbolic link already on disk', {
 
   t.end()
 })
+
+// CVE-2026-31802: a symbolic link's linkpath is allowed to keep its '..' --
+// '../sibling' is an ordinary relative symbolic link and the sanitizer leaves
+// it alone on purpose.  But a rooted linkpath such as 'c:../../../../foo/bar'
+// (a windows drive-relative path, which has a root without being absolute) has
+// that root taken off first, and what is left is still handed to fs.symlink()
+// verbatim and resolved against the directory the entry lands in.  So an
+// archive can spell an escaping target as a rooted one, walk straight past the
+// '..' rule -- which only refuses entry paths and hard links -- and end up with
+// a symbolic link *inside* the extraction target that points outside of it: a
+// live read/write handle on any file the archive names.  Once a root has been
+// stripped off a linkpath, the remainder has to be resolved from the entry's
+// own directory and refused when it lands outside.
+t.test('CVE-2026-31802 rooted symlink linkpath escaping extraction dir', {
+  skip: isWindows && 'symbolic links are not fully supported on windows'
+}, t => {
+  const base = path.resolve(unpackdir, 'rooted-symlink-escape')
+  const VICTIM = 'ORIGINAL DATA'
+  t.teardown(_ => rimraf.sync(base))
+
+  // The extraction target sits four folders deep, so every vector has real
+  // directories to walk up through and a real file waiting where it lands:
+  //
+  //   <legdir>/w/x/y/z   <- cwd
+  //
+  // entry:    the name the link would be created under, inside cwd
+  // link:     what the archive spells, root and all
+  // win:      the same target spelled with windows separators
+  // victim:   path, relative to legdir, of the file the link resolves to
+  // through:  what to write, relative to cwd, to go through the link
+  const vectors = [
+    {
+      // resolved from cwd/a, the four '..' land on <legdir>/w
+      entry: 'a/esc_deep',
+      link: 'c:../../../../foo/bar',
+      win: 'c:..\\..\\..\\..\\foo\\bar',
+      victim: 'w/foo/bar',
+      through: 'a/esc_deep'
+    },
+    {
+      // the bare case: the link points straight at cwd's parent, so anything
+      // written through it lands beside the extraction target
+      entry: 'esc_bare',
+      link: 'c:..',
+      win: 'c:..',
+      victim: 'w/x/y/victim.txt',
+      through: 'esc_bare/victim.txt'
+    },
+    {
+      // doubly rooted ('/c:'), resolved from cwd/a/b
+      entry: 'a/b/esc_double',
+      link: '/c:../../../foo/baz',
+      win: '\\c:..\\..\\..\\foo\\baz',
+      victim: 'w/x/y/foo/baz',
+      through: 'a/b/esc_double'
+    }
+  ]
+
+  // ...and the guard must not be over-broad.  A rooted linkpath whose '..'
+  // still lands inside the extraction target is only stripped, as before, and
+  // a rootless relative one is not touched at all.
+  const okRooted = {
+    entry: 'a/b/ok_root',
+    link: 'c:../ok/target',
+    win: 'c:..\\ok\\target',
+    reads: '../ok/target'
+  }
+  const okPlain = {
+    entry: 'plain_rel',
+    link: '../sibling',
+    reads: '../sibling'
+  }
+
+  // three refusals, then the safe rooted linkpath stripped the way it always
+  // was; the rootless relative one says nothing at all
+  const expectWarnings = [
+    'linkpath escapes extraction directory',
+    'linkpath escapes extraction directory',
+    'linkpath escapes extraction directory',
+    'stripping c: from absolute linkpath'
+  ]
+
+  const tar = (spelling, oks) => makeTar(vectors.map(v => ({
+    path: v.entry,
+    type: 'SymbolicLink',
+    linkpath: v[spelling]
+  })).concat(oks.map(ok => ({
+    path: ok.entry,
+    type: 'SymbolicLink',
+    linkpath: ok[spelling] || ok.link
+  }))).concat([
+    '',
+    ''
+  ]))
+
+  const setup = leg => {
+    const legdir = path.resolve(base, leg)
+    rimraf.sync(legdir)
+    mkdirp.sync(path.resolve(legdir, 'w/x/y/z'))
+    // plant a file at every location an escaping linkpath resolves to, so
+    // each vector has something real to reach for
+    vectors.forEach(v => {
+      const victim = path.resolve(legdir, v.victim)
+      mkdirp.sync(path.dirname(victim))
+      fs.writeFileSync(victim, VICTIM)
+    })
+    return legdir
+  }
+
+  const check = (t, legdir, warnings, oks) => {
+    const cwd = path.resolve(legdir, 'w/x/y/z')
+
+    vectors.forEach(v => {
+      t.throws(_ => fs.lstatSync(path.resolve(cwd, v.entry)),
+        { code: 'ENOENT' }, 'no symbolic link made for ' + v.entry)
+      // had the link been made, this write would have gone straight through
+      // it and landed on the file outside the extraction target.  It either
+      // fails outright or makes an ordinary file inside cwd; both are fine.
+      try {
+        fs.writeFileSync(path.resolve(cwd, v.through), '+PWNED')
+      } catch (er) {}
+      t.equal(fs.readFileSync(path.resolve(legdir, v.victim), 'utf8'), VICTIM,
+        'the file outside the extraction target is intact: ' + v.victim)
+    })
+
+    oks.forEach(ok => {
+      t.equal(fs.lstatSync(path.resolve(cwd, ok.entry)).isSymbolicLink(), true,
+        ok.entry + ' is still created')
+      t.equal(fs.readlinkSync(path.resolve(cwd, ok.entry)), ok.reads,
+        ok.entry + ' keeps the target the sanitizer left it')
+    })
+
+    t.strictSame(warnings, expectWarnings,
+      'each escaping linkpath refused, the safe rooted one only stripped')
+    t.end()
+  }
+
+  t.test('posix spelling', t => {
+    const oks = [okRooted, okPlain]
+    const data = tar('link', oks)
+
+    t.test('async', t => {
+      const legdir = setup('async')
+      const warnings = []
+      new Unpack({
+        cwd: path.resolve(legdir, 'w/x/y/z'),
+        onwarn: (w, d) => warnings.push(w)
+      }).on('close', _ => check(t, legdir, warnings, oks)).end(data)
+    })
+
+    t.test('sync', t => {
+      const legdir = setup('sync')
+      const warnings = []
+      new UnpackSync({
+        cwd: path.resolve(legdir, 'w/x/y/z'),
+        onwarn: (w, d) => warnings.push(w)
+      }).end(data)
+      check(t, legdir, warnings, oks)
+    })
+
+    t.end()
+  })
+
+  // the same vectors as the advisory spells them, with \ separators, which are
+  // only directory separators on windows.  Fake the platform so
+  // normalize-windows-path turns them into '/', the way it would there.
+  t.test('windows \\ spelling', t => {
+    const oks = [okRooted]
+    // build the archive with the real posix Header, before faking the platform
+    const data = tar('win', oks)
+
+    // tap 12 has no t.mock(), so swap the faked platform in and re-require the
+    // library with a cleared cache, since normalize-windows-path.js reads the
+    // platform once at load time.
+    const libdir = path.resolve(__dirname, '..', 'lib') + path.sep
+    const reload = platform => {
+      if (platform)
+        process.env.TESTING_TAR_FAKE_PLATFORM = platform
+      else
+        delete process.env.TESTING_TAR_FAKE_PLATFORM
+      Object.keys(require.cache)
+        .filter(k => k.indexOf(libdir) === 0)
+        .forEach(k => delete require.cache[k])
+      return require('../lib/unpack.js')
+    }
+
+    t.teardown(_ => reload(null))
+
+    t.test('async', t => {
+      const WinUnpack = reload('win32')
+      const legdir = setup('win-async')
+      const warnings = []
+      new WinUnpack({
+        cwd: path.resolve(legdir, 'w/x/y/z'),
+        onwarn: (w, d) => warnings.push(w)
+      }).on('close', _ => check(t, legdir, warnings, oks)).end(data)
+    })
+
+    t.test('sync', t => {
+      const WinUnpackSync = reload('win32').Sync
+      const legdir = setup('win-sync')
+      const warnings = []
+      new WinUnpackSync({
+        cwd: path.resolve(legdir, 'w/x/y/z'),
+        onwarn: (w, d) => warnings.push(w)
+      }).end(data)
+      check(t, legdir, warnings, oks)
+    })
+
+    t.end()
+  })
+
+  t.test('preservePaths leaves the escaping linkpath alone', t => {
+    // opting out has to keep working: with preservePaths the linkpath is used
+    // exactly as the archive spelled it, escape and all
+    const oks = [okRooted, okPlain]
+    const legdir = setup('preserve')
+    const cwd = path.resolve(legdir, 'w/x/y/z')
+    const warnings = []
+    new UnpackSync({
+      cwd: cwd,
+      preservePaths: true,
+      onwarn: (w, d) => warnings.push(w)
+    }).end(tar('link', oks))
+    vectors.forEach(v => {
+      t.equal(fs.readlinkSync(path.resolve(cwd, v.entry)), v.link,
+        'the escaping target of ' + v.entry + ' is preserved')
+    })
+    t.strictSame(warnings, [], 'no linkpath warnings')
+    t.end()
+  })
+
+  t.end()
+})
