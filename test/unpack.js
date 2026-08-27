@@ -21,6 +21,7 @@ const rimraf = require('rimraf')
 const mkdirp = require('mkdirp')
 const mutateFS = require('mutate-fs')
 const eos = require('end-of-stream')
+const ReadEntry = require('../lib/read-entry.js')
 
 t.teardown(_ => rimraf.sync(unpackdir))
 
@@ -3279,6 +3280,113 @@ t.test('prune dirCache on unicode-normalized match', t => {
     const dirCache = new Map()
     new UnpackSync({ cwd: cwd, dirCache: dirCache }).end(data)
     check(t, cwd, dirCache)
+  })
+
+  t.end()
+})
+
+// CVE-2024-28863: a single tar entry can name a path nested hundreds of
+// thousands of levels deep.  Unpacking it means an mkdir per level, so one
+// 450kb archive is enough to keep the process (and the file system) busy for
+// a very long time.  Anything deeper than maxDepth is warned about and
+// skipped instead, and nothing is written for it at all.
+t.test('excessively deep subfolder nesting', t => {
+  const dir = path.resolve(unpackdir, 'excessively-deep')
+  t.teardown(_ => rimraf.sync(dir))
+
+  const tf = path.resolve(fixtures, 'excessively-deep.tar')
+  const data = fs.readFileSync(tf)
+  const warnings = []
+  const onwarn = (msg, d) => warnings.push([msg, d])
+
+  const setup = leg => {
+    const cwd = path.resolve(dir, leg)
+    rimraf.sync(cwd)
+    mkdirp.sync(cwd)
+    return cwd
+  }
+
+  const check = (t, cwd, maxDepth) => {
+    maxDepth = maxDepth === undefined ? 1024 : maxDepth
+    t.equal(warnings.length, 1,
+      'exactly one warning, got: ' + warnings.map(w => w[0]).join(' | '))
+    const w = warnings[0] || []
+    t.equal(w[0], 'excessively deep subfolder nesting')
+    const d = w[1] || {}
+    t.ok(d.entry instanceof ReadEntry, 'the offending entry is reported')
+    t.match(d.path, /^\.(\/a){1024,}\/foo\.txt$/, 'the offending path')
+    t.equal(d.depth, 222372, 'the depth of the entry')
+    t.equal(d.depth, String(d.path).split('/').length,
+      'depth is the path depth')
+    t.ok(d.depth > maxDepth, 'the reported depth is over the limit')
+    t.equal(d.maxDepth, maxDepth, 'the limit that was exceeded')
+    t.strictSame(fs.readdirSync(cwd), [],
+      'nothing at all is created in the extraction target')
+    warnings.length = 0
+    t.end()
+  }
+
+  t.test('async', t => {
+    const cwd = setup('async')
+    new Unpack({
+      cwd: cwd,
+      onwarn: onwarn
+    }).on('end', () => check(t, cwd)).end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = setup('sync')
+    new UnpackSync({
+      cwd: cwd,
+      onwarn: onwarn
+    }).end(data)
+    check(t, cwd)
+  })
+
+  t.test('async set md', t => {
+    const cwd = setup('async-set-md')
+    new Unpack({
+      cwd: cwd,
+      onwarn: onwarn,
+      maxDepth: 64
+    }).on('end', () => check(t, cwd, 64)).end(data)
+  })
+
+  t.test('sync set md', t => {
+    const cwd = setup('sync-set-md')
+    new UnpackSync({
+      cwd: cwd,
+      onwarn: onwarn,
+      maxDepth: 64
+    }).end(data)
+    check(t, cwd, 64)
+  })
+
+  t.test('maxDepth: Infinity turns the limit off', t => {
+    // The limit is opt-out, so `maxDepth: Infinity` has to skip the depth
+    // check entirely and leave a normal archive completely untouched.
+    const cwd = setup('unlimited')
+    const shallow = makeTar([
+      {
+        path: 'a/b/c.txt',
+        type: 'File',
+        size: 1
+      },
+      'x',
+      '',
+      ''
+    ])
+    new Unpack({
+      cwd: cwd,
+      onwarn: onwarn,
+      maxDepth: Infinity
+    }).on('end', () => {
+      t.strictSame(warnings, [], 'no depth warning with maxDepth: Infinity')
+      t.equal(fs.readFileSync(cwd + '/a/b/c.txt', 'utf8'), 'x',
+        'the archive is unpacked as usual')
+      warnings.length = 0
+      t.end()
+    }).end(shallow)
   })
 
   t.end()
