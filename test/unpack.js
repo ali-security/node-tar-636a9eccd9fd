@@ -2542,3 +2542,228 @@ t.test('drop entry from dirCache if no longer a directory', t => {
     check(t, path)
   })
 })
+
+const isWindows = process.platform === 'win32'
+
+// CVE-2021-37701: the dirCache was keyed by the raw entry path, so an entry
+// name containing a \ separator could seed cache entries that the pruning
+// loop then failed to recognize as belonging to the symlink that replaced
+// them.  Without normalizing separators, mkdir() split 'x\y' into two path
+// segments while the dirCache, the symlink and the file all used the literal
+// one-segment name -- so the file was written straight through the symlink.
+t.test('dirCache poisoned by \\ in entry names', {
+  skip: isWindows && 'symlinks not fully supported'
+}, t => {
+  const dir = path.resolve(unpackdir, 'dircache-backslash')
+  t.teardown(_ => rimraf.sync(dir))
+
+  const data = makeTar([
+    {
+      path: 'x\\y',
+      type: 'Directory',
+      mode: 0o755
+    },
+    {
+      path: 'x\\y',
+      type: 'SymbolicLink',
+      linkpath: '../outside'
+    },
+    {
+      path: 'x\\y/z',
+      type: 'File',
+      size: 5,
+      mode: 0o644
+    },
+    'pwned',
+    '',
+    ''
+  ])
+
+  const setup = leg => {
+    const legdir = path.resolve(dir, leg)
+    rimraf.sync(legdir)
+    mkdirp.sync(path.resolve(legdir, 'cwd'))
+    mkdirp.sync(path.resolve(legdir, 'outside'))
+    return legdir
+  }
+
+  const check = (t, legdir, warnings) => {
+    const cwd = path.resolve(legdir, 'cwd')
+    const outside = path.resolve(legdir, 'outside')
+    t.same(warnings, ['Cannot extract through symbolic link'],
+      'refused to extract through the symlink')
+    t.ok(fs.lstatSync(cwd + '/x\\y').isSymbolicLink(), 'entry is a symlink')
+    t.throws(_ => fs.statSync(outside + '/z'),
+      'nothing written outside the extraction directory')
+    t.strictSame(fs.readdirSync(outside), [], 'outside dir untouched')
+    t.throws(_ => fs.readFileSync(cwd + '/x\\y/z'), 'no file through the link')
+    t.end()
+  }
+
+  t.test('async', t => {
+    const legdir = setup('async')
+    const warnings = []
+    new Unpack({ cwd: path.resolve(legdir, 'cwd') })
+      .on('warn', msg => warnings.push(msg))
+      .on('close', _ => check(t, legdir, warnings))
+      .end(data)
+  })
+
+  t.test('sync', t => {
+    const legdir = setup('sync')
+    const warnings = []
+    new UnpackSync({ cwd: path.resolve(legdir, 'cwd') })
+      .on('warn', msg => warnings.push(msg))
+      .end(data)
+    check(t, legdir, warnings)
+  })
+
+  t.end()
+})
+
+// CVE-2021-37701: the dirCache pruning was case-sensitive, so on a
+// case-insensitive filesystem a 'FOO' symlink replacing the 'foo' directory
+// left '<cwd>/foo' and '<cwd>/foo/bar' behind in the cache.  A later
+// 'foo/bar/...' entry then hit the cache and skipped the symlink check
+// entirely, writing through the link.  The escape itself is not reachable on
+// a case-sensitive filesystem, so the stale-key invariant is the assertion.
+t.test('prune dirCache on case-insensitive match', {
+  skip: isWindows && 'symlinks not fully supported'
+}, t => {
+  const dir = path.resolve(unpackdir, 'dircache-case')
+  t.teardown(_ => rimraf.sync(dir))
+
+  const data = makeTar([
+    {
+      path: 'foo/bar',
+      type: 'Directory',
+      mode: 0o755
+    },
+    {
+      path: 'FOO',
+      type: 'SymbolicLink',
+      linkpath: './elsewhere'
+    },
+    '',
+    ''
+  ])
+
+  const setup = leg => {
+    const cwd = path.resolve(dir, leg)
+    rimraf.sync(cwd)
+    mkdirp.sync(cwd)
+    return cwd
+  }
+
+  const check = (t, cwd, dirCache) => {
+    t.ok(fs.lstatSync(cwd + '/FOO').isSymbolicLink(), 'FOO is a symlink')
+    t.notOk(dirCache.has(cwd + '/foo'), 'stale foo dirCache entry pruned')
+    t.notOk(dirCache.has(cwd + '/foo/bar'), 'stale foo/bar dirCache entry pruned')
+    t.strictSame(Array.from(dirCache.keys()), [cwd],
+      'only the cwd is left in the dirCache')
+    t.end()
+  }
+
+  t.test('async', t => {
+    const cwd = setup('async')
+    const dirCache = new Map()
+    new Unpack({ cwd: cwd, dirCache: dirCache })
+      .on('close', _ => check(t, cwd, dirCache))
+      .end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = setup('sync')
+    const dirCache = new Map()
+    new UnpackSync({ cwd: cwd, dirCache: dirCache }).end(data)
+    check(t, cwd, dirCache)
+  })
+
+  t.end()
+})
+
+// CVE-2021-37701: on windows both \ and / are directory separators, so every
+// path tar handles has to be normalized to / before it is compared against,
+// or stored in, the dirCache.  Fake the platform to exercise that arm.
+t.test('normalize \\ to / on windows', {
+  skip: isWindows && 'fake platform test, run on posix'
+}, t => {
+  const dir = path.resolve(unpackdir, 'win32-normalize')
+
+  // built with the real (posix) Header, before the platform is faked
+  const data = makeTar([
+    {
+      path: 'a\\b/c',
+      type: 'File',
+      size: 1,
+      mode: 0o644
+    },
+    'x',
+    '',
+    ''
+  ])
+
+  // tap 12 has no t.mock(), so swap the faked platform in and re-require the
+  // library with a cleared cache, since normalize-windows-path.js reads the
+  // platform once at load time.
+  const libdir = path.resolve(__dirname, '..', 'lib') + path.sep
+  const reload = platform => {
+    if (platform)
+      process.env.TESTING_TAR_FAKE_PLATFORM = platform
+    else
+      delete process.env.TESTING_TAR_FAKE_PLATFORM
+    Object.keys(require.cache)
+      .filter(k => k.indexOf(libdir) === 0)
+      .forEach(k => delete require.cache[k])
+    return require('../lib/unpack.js')
+  }
+
+  t.teardown(_ => {
+    rimraf.sync(dir)
+    reload(null)
+  })
+
+  const setup = leg => {
+    const cwd = path.resolve(dir, leg)
+    rimraf.sync(cwd)
+    mkdirp.sync(cwd)
+    return cwd
+  }
+
+  const readMaybe = p => {
+    try {
+      return fs.readFileSync(p, 'utf8')
+    } catch (er) {
+      return er.code
+    }
+  }
+
+  const check = (t, cwd, warnings) => {
+    t.same(warnings, [], 'no warnings')
+    t.equal(readMaybe(cwd + '/a/b/c'), 'x', 'entry landed at a/b/c')
+    t.throws(_ => fs.lstatSync(cwd + '/a\\b'), 'no literal a\\b entry')
+    t.end()
+  }
+
+  t.test('async', t => {
+    const WinUnpack = reload('win32')
+    const cwd = setup('async')
+    const warnings = []
+    new WinUnpack({ cwd: cwd })
+      .on('warn', msg => warnings.push(msg))
+      .on('close', _ => check(t, cwd, warnings))
+      .end(data)
+  })
+
+  t.test('sync', t => {
+    const WinUnpackSync = reload('win32').Sync
+    const cwd = setup('sync')
+    const warnings = []
+    new WinUnpackSync({ cwd: cwd })
+      .on('warn', msg => warnings.push(msg))
+      .end(data)
+    check(t, cwd, warnings)
+  })
+
+  t.end()
+})
