@@ -202,6 +202,26 @@ t.test('parse', t => {
     global: false
   })
 
+  // test that null just safely terminates the value
+  t.same(Pax.parse('12 path=x\0y\n', null, false), {
+    atime: null,
+    charset: null,
+    comment: null,
+    ctime: null,
+    gid: null,
+    gname: null,
+    linkpath: null,
+    mtime: null,
+    path: 'x',
+    size: null,
+    uid: null,
+    uname: null,
+    dev: null,
+    ino: null,
+    nlink: null,
+    global: false
+  })
+
   t.same(Pax.parse('20 mtime=1491436800\n', null, false), {
     atime: null,
     charset: null,
