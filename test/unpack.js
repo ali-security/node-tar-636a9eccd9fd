@@ -2856,6 +2856,19 @@ t.test('drive-relative paths', t => {
       raw: '//?/X:/y/z',
       warning: ['stripping //?/X:/ from absolute path', '//?/X:/y/z'],
       lands: 'y/z'
+    },
+    // CVE-2021-32804: taking one root off '///a/b/c' leaves '//a/b/c', which
+    // is still absolute, so a single strip does not sanitize anything
+    {
+      raw: '///a/b/c',
+      warning: ['stripping /// from absolute path', '///a/b/c'],
+      lands: 'a/b/c'
+    },
+    // CVE-2021-32804: same trick with a drive root glued onto itself
+    {
+      raw: 'c:/c:/foo',
+      warning: ['stripping c:/c:/ from absolute path', 'c:/c:/foo'],
+      lands: 'foo'
     }
   ]
 

@@ -362,7 +362,12 @@ t.test('nonexistent file', t => {
 })
 
 t.test('absolute path', t => {
-  const f = path.resolve(files, '512-bytes.txt')
+  // CVE-2021-32804: a single strip of the root leaves the *next* root
+  // behind, so repeat the root and check every one of them comes off.
+  const absolute = path.resolve(files, '512-bytes.txt')
+  const root = path.parse(absolute).root
+  const f = root + root + root + absolute
+  const warn = root + root + root + root
   t.test('preservePaths=false strict=false', t => {
     const warnings = []
     const ws = new WriteEntry(f, {
@@ -375,13 +380,13 @@ t.test('absolute path', t => {
       out = Buffer.concat(out)
       t.equal(out.length, 1024)
       t.match(warnings, [[
-        /stripping .* from absolute path/, f
+        'stripping ' + warn + ' from absolute path', f
       ]])
 
       t.match(ws.header, {
         cksumValid: true,
         needPax: false,
-        path: f.replace(/^(\/|[a-z]:\\\\)/, ''),
+        path: f.replace(/^(\/|[a-z]:\\\\){4}/, ''),
         mode: 0o644,
         size: 512,
         linkpath: null,
@@ -439,6 +444,40 @@ t.test('absolute path', t => {
       })
     }, { message: /stripping .* from absolute path/, data: f })
     t.end()
+  })
+
+  // CVE-2021-32804: on posix these windows roots are not 'absolute', but
+  // path.win32.resolve() escapes with them all the same, and taking just one
+  // of them off leaves the next one behind.  Point `absolute` at a real
+  // fixture so the entry body can still be read while the entry path itself
+  // stays hostile.
+  t.test('repeated drive roots', {
+    skip: isWindows && 'posix spelling of a windows path'
+  }, t => {
+    const p = 'c:\\c:\\c:\\d:\\512-bytes.txt'
+    const warnings = []
+    const ws = new WriteEntry(p, {
+      cwd: files,
+      absolute: path.resolve(files, '512-bytes.txt'),
+      onwarn: (m, d) => warnings.push([m, d])
+    })
+    let out = []
+    ws.on('data', c => out.push(c))
+    ws.on('end', _ => {
+      out = Buffer.concat(out)
+      t.equal(out.length, 1024)
+      t.strictSame(warnings, [[
+        'stripping c:\\c:\\c:\\d:\\ from absolute path', p
+      ]])
+      t.equal(ws.path, '512-bytes.txt', 'every root came off')
+      t.match(ws.header, {
+        cksumValid: true,
+        needPax: false,
+        path: '512-bytes.txt',
+        size: 512
+      })
+      t.end()
+    })
   })
 
   t.end()
@@ -1078,6 +1117,100 @@ t.test('write entry from read entry', t => {
       }))
       t.end()
     })
+    t.end()
+  })
+
+  // CVE-2021-32804: taking a single root off '///a/b/c' leaves '//a/b/c',
+  // which is still absolute, so the "sanitized" entry escapes anyway.  Every
+  // root has to come off, however many of them are glued together.
+  t.test('repeated root', t => {
+    const fileEntry = new ReadEntry(new Header(data))
+    fileEntry.path = '///a/b/c'
+
+    const warnings = []
+    const wetFile = new WriteEntry.Tar(fileEntry, {
+      onwarn: (msg, d) => warnings.push(msg, d)
+    })
+    t.same(warnings, ['stripping /// from absolute path', '///a/b/c'])
+    t.equal(wetFile.path, 'a/b/c')
+    t.equal(wetFile.header.path, 'a/b/c')
+    t.end()
+  })
+
+  // CVE-2021-32804: this one used to not be stripped *at all* on posix,
+  // because the platform parser was consulted and 'c:/c:/foo' has no posix
+  // root -- yet path.win32.resolve() happily escapes with it.
+  t.test('repeated drive root', t => {
+    const fileEntry = new ReadEntry(new Header(data))
+    fileEntry.path = 'c:/c:/foo'
+
+    const warnings = []
+    const wetFile = new WriteEntry.Tar(fileEntry, {
+      onwarn: (msg, d) => warnings.push(msg, d)
+    })
+    t.same(warnings, ['stripping c:/c:/ from absolute path', 'c:/c:/foo'])
+    t.equal(wetFile.path, 'foo')
+    t.equal(wetFile.header.path, 'foo')
+    t.end()
+  })
+
+  t.test('every spelling of a root comes off', t => {
+    // input -> [ the root that must be warned about, what is left of it ]
+    const cases = {
+      '/': ['/', ''],
+      '////': ['////', ''],
+      'c:///a/b/c': ['c:///', 'a/b/c'],
+      '\\\\foo\\bar\\baz': ['\\\\foo\\bar\\', 'baz'],
+      '//foo//bar//baz': ['//', 'foo//bar//baz'],
+      'c:\\c:\\c:\\c:\\\\d:\\e/f/g': ['c:\\c:\\c:\\c:\\\\d:\\', 'e/f/g'],
+      // drive-relative: not absolute, but still rooted on another drive
+      'c:..\\foo': ['c:', '..\\foo'],
+      // '//?/c:/' is a real root, and must come off whole rather than one
+      // leading '/' at a time
+      '//?/c:/x/y': ['//?/c:/', 'x/y'],
+      '//?/c:/c:/c:/x': ['//?/c:/c:/c:/', 'x']
+    }
+
+    Object.keys(cases).forEach(input => {
+      t.test(JSON.stringify(input), t => {
+        const root = cases[input][0]
+        const stripped = cases[input][1]
+        const fileEntry = new ReadEntry(new Header(data))
+        fileEntry.path = input
+
+        const warnings = []
+        const wet = new WriteEntry.Tar(fileEntry, {
+          onwarn: (msg, d) => warnings.push(msg, d)
+        })
+        t.same(warnings, [
+          'stripping ' + root + ' from absolute path', input
+        ], 'warned about the whole root of ' + input)
+        t.equal(wet.path, stripped)
+        t.equal(wet.header.path, stripped)
+        t.end()
+      })
+    })
+
+    t.end()
+  })
+
+  t.test('relative paths are left alone', t => {
+    ;['', 'a/b/c'].forEach(input => {
+      t.test(JSON.stringify(input), t => {
+        const fileEntry = new ReadEntry(new Header(data))
+        fileEntry.path = input
+
+        const warnings = []
+        const wet = new WriteEntry.Tar(fileEntry, {
+          onwarn: (msg, d) => warnings.push(msg, d)
+        })
+        t.same(warnings, [])
+        t.equal(wet.path, input)
+        t.equal(wet.header.path, input)
+        t.end()
+      })
+    })
+
     t.end()
   })
 
