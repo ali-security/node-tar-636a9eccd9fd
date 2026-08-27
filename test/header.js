@@ -2,6 +2,7 @@
 const Buffer = require('../lib/buffer.js')
 const t = require('tap')
 const Header = require('../lib/header.js')
+const types = require('../lib/types.js')
 
 t.test('ustar format', t => {
   const buf = Buffer.from(
@@ -555,5 +556,48 @@ t.test('dir with long body', t => {
   const h = new Header(b)
   t.equal(h.type, 'Directory')
   t.equal(h.size, 0)
+  t.end()
+})
+
+t.test('do not apply ex/gex to meta entries', t => {
+  const normalEntryTypes = new Set([
+    'File',
+    'OldFile',
+    'Link',
+    'SymbolicLink',
+    'CharacterDevice',
+    'BlockDevice',
+    'Directory',
+    'FIFO',
+    'ContiguousFile',
+    'GNUDumpDir'
+  ])
+
+  types.name.forEach(type => {
+    const data = new Header({
+      path: 'x',
+      type: type,
+      size: 1
+    })
+    data.encode()
+    const h = new Header(data.block, 0, {
+      size: 100,
+      dev: 5678,
+      ino: 9876
+    })
+    if (normalEntryTypes.has(type)) {
+      if (h.type === 'Directory')
+        t.equal(h.size, 0, 'Directories always size=0, no matter what')
+      else
+        t.equal(h.size, 100, 'expect ' + type + ' to respect extended header')
+      t.equal(h.dev, 5678, 'expect ' + type + ' to respect extended header')
+      t.equal(h.ino, 9876, 'expect ' + type + ' to respect extended header')
+    } else {
+      t.equal(h.size, 1, 'expect ' + type + ' to ignore extended header')
+      t.equal(h.dev, undefined, 'expect ' + type + ' to ignore extended header')
+      t.equal(h.ino, undefined, 'expect ' + type + ' to ignore extended header')
+    }
+  })
+
   t.end()
 })
