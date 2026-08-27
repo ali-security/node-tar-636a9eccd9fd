@@ -601,3 +601,28 @@ t.test('do not apply ex/gex to meta entries', t => {
 
   t.end()
 })
+
+t.test('no negative size', t => {
+  const i = new Header({ size: -1000 })
+  // stubbornly refuse
+  t.equal(i.size, null)
+  t.end()
+})
+
+t.test('no negative size in a decoded header', t => {
+  const h = new Header({ path: 'negative-size', size: 0 })
+  // set it on the instance, so that it goes around the guard in set(), and a
+  // negative size is actually encoded into the block, the way a hostile
+  // archive would carry it.
+  h.size = -1000
+  const buf = Buffer.alloc(512)
+  h.encode(buf, 0)
+
+  const d = new Header(buf)
+  t.equal(d.cksumValid, true, 'block is otherwise a valid header')
+  t.equal(d.path, 'negative-size', 'the rest of the header is read')
+  // a negative size means a negative body length, which the parser can never
+  // consume, so drop it rather than pass it along
+  t.equal(d.size, undefined, 'the negative size is dropped')
+  t.end()
+})

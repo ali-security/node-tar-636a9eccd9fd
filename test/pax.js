@@ -366,3 +366,35 @@ t.test('each known field is read as the type it is defined to have', t => {
 
   t.end()
 })
+
+t.test('no negative size', t => {
+  // a negative size makes the entry body length negative, so nothing is ever
+  // consumed from the stream and the parser spins on the same block forever.
+  // refuse it at the point it is read, rather than carrying it any further.
+  const neg = Pax.parse('14 size=-1000\n')
+  t.same(neg, {
+    atime: null,
+    charset: null,
+    comment: null,
+    ctime: null,
+    gid: null,
+    gname: null,
+    linkpath: null,
+    mtime: null,
+    path: null,
+    size: null,
+    uid: null,
+    uname: null,
+    dev: null,
+    ino: null,
+    nlink: null,
+    global: false
+  })
+  // t.same is loose, so pin the one field this is about strictly
+  t.equal(neg.size, null, 'a negative size is not set at all')
+
+  const pos = Pax.parse('13 size=1000\n')
+  t.equal(pos.size, 1000, 'a valid size is still read')
+  t.equal(typeof pos.size, 'number', 'and it is still a number')
+  t.end()
+})
