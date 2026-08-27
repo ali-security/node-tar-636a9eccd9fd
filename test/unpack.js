@@ -2552,9 +2552,8 @@ const isWindows = process.platform === 'win32'
 // them.  Without normalizing separators, mkdir() split 'x\y' into two path
 // segments while the dirCache, the symlink and the file all used the literal
 // one-segment name -- so the file was written straight through the symlink.
-// The link target has to stay inside cwd, because a linkpath that walks out
-// of the extraction target with '..' is now refused outright, and the entry
-// would never reach the dirCache at all.
+// The link target is kept inside cwd so that this exercises the dirCache and
+// nothing else.
 t.test('dirCache poisoned by \\ in entry names', {
   skip: isWindows && 'symlinks not fully supported'
 }, t => {
@@ -3406,8 +3405,10 @@ t.test('linkpath is sanitized like the entry path', {
   // which ignores cwd entirely when the linkpath is absolute, so the link
   // makes a file outside the extraction target writable from inside it;
   // and a symbolic link's linkpath is handed to fs.symlink() verbatim, so
-  // it can be pointed at anywhere on the system.  Both fields now go
-  // through the same check as entry.path.
+  // an absolute one can be pointed at anywhere on the system.  Both fields
+  // now have their root stripped the way entry.path does.  A '..' is refused
+  // for entry.path and for a hard link's linkpath; a symbolic link's is left
+  // alone, since that is just an ordinary relative link.
   //
   // The names here are kept short on purpose: an absolute linkpath only
   // fits in a tar header up to 100 bytes, and a truncated one would make
@@ -3484,15 +3485,16 @@ t.test('linkpath is sanitized like the entry path', {
     t.equal(path.resolve(cwd, target).indexOf(cwd + path.sep), 0,
       'the target stays inside the extraction target')
 
-    t.throws(_ => fs.lstatSync(cwd + '/sym_rel'), { code: 'ENOENT' },
-      'the symbolic link with a ".." target is not created at all')
+    t.equal(fs.lstatSync(cwd + '/sym_rel').isSymbolicLink(), true,
+      'the symbolic link with a ".." target is created')
+    t.equal(fs.readlinkSync(cwd + '/sym_rel'), '../../escape',
+      'a relative symbolic link target is left as the archive spelled it')
 
     t.same(sanitized(warnings), [
       'stripping / from absolute linkpath',
       'linkpath contains \'..\'',
-      'stripping / from absolute linkpath',
-      'linkpath contains \'..\''
-    ], 'each linkpath is warned about')
+      'stripping / from absolute linkpath'
+    ], 'each rewritten or refused linkpath is warned about')
     t.end()
   }
 
@@ -3528,6 +3530,131 @@ t.test('linkpath is sanitized like the entry path', {
       'the ".." symbolic link target is preserved')
     t.same(sanitized(warnings), [], 'no linkpath warnings')
     t.end()
+  })
+
+  t.end()
+})
+
+t.test('GHSA-34x7-hfp2-rc4v hardlink .. escape', {
+  skip: isWindows && 'symbolic links are not fully supported on windows'
+}, t => {
+  // [HARDLINK] resolves a hard link's linkpath with
+  // path.resolve(this.cwd, entry.linkpath): always against the top of the
+  // extraction target, never against the directory the entry itself lands
+  // in.  So a linkpath that reads as "stays inside" when it is resolved
+  // from a deep entry -- 'a/b/c/d/' plus '../../../../secret.txt' is just
+  // 'secret.txt' -- is in fact four levels above the extraction target by
+  // the time fs.link() runs.  A check that resolved the linkpath from the
+  // entry's own directory would wave that one through and hand the archive
+  // a hard link, which is a live read/write handle, on a file outside the
+  // extraction target.  So every '..' in a hard link's linkpath is refused,
+  // however deep the entry sits.
+  //
+  // A symbolic link's linkpath is only ever the literal contents of the
+  // link, so '../sibling' is an ordinary relative symbolic link and is left
+  // exactly as the archive spelled it.
+  const base = path.resolve(unpackdir, 'ghsa34x7')
+  const SECRET = 'ORIGINAL DATA'
+
+  t.teardown(_ => rimraf.sync(base))
+
+  const upDots = up => new Array(up + 1).join('../')
+
+  // the file `up` levels above the extraction target
+  const secretAt = (cwd, up) =>
+    path.resolve(cwd, upDots(up) + 'secret.txt')
+
+  // entry path in the archive -> how many levels above cwd fs.link() would
+  // land.  'deep_hard' is the interesting one: relative to its own folder
+  // the linkpath resolves back to the top of the extraction target, so it
+  // looks harmless, and only the cwd-relative resolution reveals the escape.
+  const hardlinks = [
+    ['exploit_hard', 1],
+    ['sub/nested_hard', 2],
+    ['sub/deeper/mid_hard', 3],
+    ['a/b/c/d/deep_hard', 4]
+  ]
+
+  const dirs = ['sub/', 'sub/deeper/', 'a/', 'a/b/', 'a/b/c/', 'a/b/c/d/']
+
+  const data = makeTar(dirs.map(d => ({
+    path: d,
+    type: 'Directory'
+  })).concat(hardlinks.map(hl => ({
+    path: hl[0],
+    type: 'Link',
+    linkpath: upDots(hl[1]) + 'secret.txt'
+  }))).concat([
+    {
+      path: 'valid_sym',
+      type: 'SymbolicLink',
+      linkpath: '../secret.txt'
+    },
+    {
+      path: 'sub/inner_sym',
+      type: 'SymbolicLink',
+      linkpath: '../../elsewhere'
+    },
+    '',
+    ''
+  ]))
+
+  // put the extraction target several folders deep and plant a file at
+  // every level one of the linkpaths above walks up to, so each vector has
+  // something real to reach for
+  const setup = leg => {
+    const legRoot = path.resolve(base, leg)
+    const cwd = path.resolve(legRoot, 'l4/l3/l2/l1/cwd')
+    rimraf.sync(legRoot)
+    mkdirp.sync(cwd)
+    for (let up = 1; up <= hardlinks.length; up++)
+      fs.writeFileSync(secretAt(cwd, up), SECRET)
+    return cwd
+  }
+
+  const check = (t, cwd, warnings) => {
+    hardlinks.forEach(hl => {
+      const p = path.resolve(cwd, hl[0])
+      t.throws(_ => fs.lstatSync(p), { code: 'ENOENT' },
+        'no hard link made for ' + hl[0])
+      // writing where the hard link would have been has to make a new file
+      // inside cwd, not reach the file the archive aimed at
+      fs.writeFileSync(p, 'PWNED')
+    })
+
+    for (let up = 1; up <= hardlinks.length; up++) {
+      t.equal(fs.readFileSync(secretAt(cwd, up), 'utf8'), SECRET,
+        'the file ' + up + ' level(s) above the extraction target is intact')
+    }
+
+    t.equal(fs.lstatSync(cwd + '/valid_sym').isSymbolicLink(), true,
+      'the relative symbolic link is created')
+    t.equal(fs.readlinkSync(cwd + '/valid_sym'), '../secret.txt',
+      'its target is left as the archive spelled it')
+    t.equal(fs.readlinkSync(cwd + '/sub/inner_sym'), '../../elsewhere',
+      'a relative symbolic link in a subfolder is left alone too')
+
+    t.equal(warnings.filter(w => w === 'linkpath contains \'..\'').length,
+      hardlinks.length, 'every hard link linkpath is refused')
+    t.end()
+  }
+
+  t.test('async', t => {
+    const cwd = setup('async')
+    const warnings = []
+    new Unpack({ cwd: cwd })
+      .on('warn', msg => warnings.push(msg))
+      .on('close', _ => check(t, cwd, warnings))
+      .end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = setup('sync')
+    const warnings = []
+    new UnpackSync({ cwd: cwd })
+      .on('warn', msg => warnings.push(msg))
+      .end(data)
+    check(t, cwd, warnings)
   })
 
   t.end()
