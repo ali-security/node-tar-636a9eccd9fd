@@ -4229,3 +4229,62 @@ t.test('numeric pax/entry name discernment', t => {
 
   t.end()
 })
+t.test('max decompression ratio', t => {
+  const zlib = require('zlib')
+  const size = 8 * 1024 * 1024
+  // NB: make-tar.js truncates every chunk to a single 512 byte block, so the
+  // bomb payload has to be concatenated onto the header blocks by hand.
+  const data = zlib.gzipSync(Buffer.concat([
+    makeTar([
+      {
+        path: 'bomb',
+        size: size,
+        type: 'File'
+      }
+    ]),
+    Buffer.alloc(size),
+    makeTar(['', ''])
+  ]))
+
+  const dir = path.resolve(unpackdir, 'decompression-bomb')
+  // each case gets its own cwd, since an aborted unpack may still be
+  // flushing out what it had already read when the next case starts
+  const setup = name => {
+    const cwd = path.resolve(dir, name)
+    mkdirp.sync(cwd)
+    return cwd
+  }
+  t.teardown(_ => rimraf.sync(dir))
+
+  t.test('aborts compressed bombs by default', t => {
+    t.plan(2)
+    const errors = []
+    new Unpack({ cwd: setup('async') })
+      .on('error', er => {
+        errors.push(er)
+        if (errors.length === 1)
+          t.match(er, {
+            message: /^max decompression ratio exceeded: /
+          }, 'async aborts')
+      })
+      .end(data)
+
+    t.throws(_ => new UnpackSync({ cwd: setup('sync') }).end(data), {
+      message: /^max decompression ratio exceeded: /
+    }, 'sync throws')
+  })
+
+  t.test('can be disabled explicitly', t => {
+    const cwd = setup('disabled')
+    const u = new Unpack({ cwd: cwd, maxDecompressionRatio: Infinity })
+    u.on('error', er => t.fail(er.message))
+    u.on('close', _ => {
+      t.equal(fs.statSync(path.resolve(cwd, 'bomb')).size, size,
+              'unpacked the entire payload')
+      t.end()
+    })
+    u.end(data)
+  })
+
+  t.end()
+})

@@ -753,3 +753,93 @@ t.test('CVE-2026-53655', t => {
 
   t.end()
 })
+
+t.test('max decompression ratio', t => {
+  const size = 8 * 1024 * 1024
+  // NB: make-tar.js truncates every chunk to a single 512 byte block, so the
+  // bomb payload has to be concatenated onto the header blocks by hand.
+  const bomb = zlib.gzipSync(Buffer.concat([
+    makeTar([
+      {
+        path: 'bomb',
+        size: size,
+        type: 'File'
+      }
+    ]),
+    Buffer.alloc(size),
+    makeTar(['', ''])
+  ]))
+
+  t.test('parsing aborts by default', t => {
+    const p = new Parse()
+    t.throws(_ => p.end(bomb), {
+      message: /^max decompression ratio exceeded: /
+    }, 'parsing aborts')
+    // aborting a second time is a no-op
+    p.abort('hello', new Error('hello'))
+    t.end()
+  })
+
+  t.test('aborting only happens one time', t => {
+    const p = new Parse()
+    t.throws(_ => p.abort('hello', new Error('hello')), {
+      message: 'hello'
+    })
+    // this is ignored
+    p.end(bomb)
+    t.end()
+  })
+
+  t.test('decompression stops as soon as the limit is hit', t => {
+    const p = new Parse({ maxDecompressionRatio: 2 })
+    const errors = []
+    p.on('error', er => errors.push(er.message))
+    p.end(bomb)
+    t.match(errors, [/^max decompression ratio exceeded: /], 'aborted')
+    const sym = Object.getOwnPropertySymbols(p)
+      .filter(s => s.toString() === 'Symbol(decompressedBytesRead)')[0]
+    const decompressed = p[sym]
+    t.ok(decompressed > 0 && decompressed < size / 100,
+         'stopped inflating instead of expanding the whole payload')
+    t.end()
+  })
+
+  t.test('parsing can disable the limit explicitly', t => {
+    let bytesRead = 0
+    const p = new Parse({
+      maxDecompressionRatio: Infinity,
+      onentry: entry => {
+        entry.on('data', c => bytesRead += c.length)
+        entry.resume()
+      }
+    })
+    p.on('end', _ => {
+      t.equal(bytesRead, size, 'read the entire payload')
+      t.end()
+    })
+    // split so that the compressed byte count is tracked on the first write
+    // that sniffs the gzip header, on a subsequent write, and on end(chunk)
+    p.write(bomb.slice(0, 100))
+    p.write(bomb.slice(100, 200))
+    p.end(bomb.slice(200))
+  })
+
+  t.test('ending a gzipped stream without a final chunk', t => {
+    let bytesRead = 0
+    const p = new Parse({
+      maxDecompressionRatio: Infinity,
+      onentry: entry => {
+        entry.on('data', c => bytesRead += c.length)
+        entry.resume()
+      }
+    })
+    p.on('end', _ => {
+      t.equal(bytesRead, size, 'read the entire payload')
+      t.end()
+    })
+    p.write(bomb)
+    p.end()
+  })
+
+  t.end()
+})

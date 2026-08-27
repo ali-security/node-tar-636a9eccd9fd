@@ -330,3 +330,48 @@ t.test('numeric pax/entry name discernment', t => {
 
   t.end()
 })
+
+t.test('max decompression ratio', t => {
+  const zlib = require('zlib')
+  const size = 8 * 1024 * 1024
+  const dir = path.resolve(extractdir, 'decompression-bomb')
+  const file = path.resolve(dir, 'bomb.tgz')
+  rimraf.sync(dir)
+  mkdirp.sync(dir)
+  mkdirp.sync(path.resolve(dir, 'sync'))
+  mkdirp.sync(path.resolve(dir, 'async'))
+  t.teardown(_ => rimraf.sync(dir))
+
+  // NB: make-tar.js truncates every chunk to a single 512 byte block, so the
+  // bomb payload has to be concatenated onto the header blocks by hand.
+  fs.writeFileSync(file, zlib.gzipSync(Buffer.concat([
+    makeTar([
+      {
+        path: 'bomb',
+        size: size,
+        type: 'File'
+      }
+    ]),
+    Buffer.alloc(size),
+    makeTar(['', ''])
+  ])))
+
+  t.throws(_ => x({
+    sync: true,
+    file: file,
+    cwd: path.resolve(dir, 'sync')
+  }), { message: /^max decompression ratio exceeded: / }, 'sync throws')
+
+  x({
+    file: file,
+    cwd: path.resolve(dir, 'async')
+  }).then(_ => {
+    t.fail('extraction should not have completed')
+    t.end()
+  }, er => {
+    t.match(er, {
+      message: /^max decompression ratio exceeded: /
+    }, 'async rejects')
+    t.end()
+  })
+})
