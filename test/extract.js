@@ -9,6 +9,8 @@ const tars = path.resolve(__dirname, 'fixtures/tars')
 const mkdirp = require('mkdirp')
 const rimraf = require('rimraf')
 const mutateFS = require('mutate-fs')
+const makeTar = require('./make-tar.js')
+const Pax = require('../lib/pax.js')
 
 t.teardown(_ => rimraf.sync(extractdir))
 
@@ -230,6 +232,101 @@ t.test('sync gzip error edge case test', t => {
 
   t.same(fs.readdirSync(dir + '/x').sort(),
     [ '1', '10', '2', '3', '4', '5', '6', '7', '8', '9' ])
+
+  t.end()
+})
+
+// CVE-2026-59871: a pax header path made up only of digits -- '12345', a
+// perfectly ordinary file name -- used to be handed back as the Number 12345,
+// because the type of a pax value was guessed from the shape of the value.
+// Extraction then does string work on a number and the entry never lands.
+t.test('numeric pax/entry name discernment', t => {
+  const numericName = '12345'
+  const alphaName = 'abcde'
+  const body = '12345\n'
+  const names = [numericName, alphaName]
+  const stricts = [true, false]
+
+  const setup = (leg, data) => {
+    const dir = path.resolve(extractdir, 'paxname-' + leg)
+    rimraf.sync(dir)
+    mkdirp.sync(dir)
+    fs.writeFileSync(path.resolve(dir, 'tarFile'), data)
+    return dir
+  }
+
+  const tarData = (paxName, entryName) => makeTar([
+    new Pax({
+      path: paxName,
+      size: body.length
+    }, false).encode(),
+    {
+      type: 'File',
+      path: entryName,
+      mode: 0o755,
+      ctime: new Date('2000-01-01T00:00:00.000Z'),
+      mtime: new Date('2000-01-01T00:00:00.000Z'),
+      size: body.length
+    },
+    body,
+    '',
+    '',
+    // an encoded pax header is two blocks from a single chunk, and makeTar
+    // sizes the concatenation by the chunk count -- one more chunk keeps the
+    // trailing EOF blocks from being clipped off the end
+    ''
+  ])
+
+  const check = (t, dir, paxName) => {
+    t.equal(fs.readFileSync(path.resolve(dir, paxName), 'utf8'), body,
+      'the pax path was used as the string it is')
+  }
+
+  stricts.forEach(strict => {
+    t.test('strict=' + strict, t => {
+      names.forEach(paxName => {
+        t.test('paxName=' + paxName, t => {
+          names.forEach(entryName => {
+            t.test('entryName=' + entryName, t => {
+              const data = tarData(paxName, entryName)
+              const leg = strict + '-' + paxName + '-' + entryName
+
+              t.test('sync', t => {
+                const dir = setup(leg + '-sync', data)
+                x({
+                  strict: strict,
+                  sync: true,
+                  cwd: dir,
+                  file: path.resolve(dir, 'tarFile')
+                })
+                check(t, dir, paxName)
+                t.end()
+              })
+
+              t.test('async', t => {
+                const dir = setup(leg + '-async', data)
+                x({
+                  strict: strict,
+                  cwd: dir,
+                  file: path.resolve(dir, 'tarFile')
+                }).then(_ => {
+                  check(t, dir, paxName)
+                  t.end()
+                }, er => {
+                  t.error(er)
+                  t.end()
+                })
+              })
+
+              t.end()
+            })
+          })
+          t.end()
+        })
+      })
+      t.end()
+    })
+  })
 
   t.end()
 })

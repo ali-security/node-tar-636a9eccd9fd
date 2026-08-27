@@ -273,3 +273,96 @@ t.test('parse', t => {
 
   t.end()
 })
+
+t.test('string fields stay string', t => {
+  // The type of a pax value used to be guessed from the shape of the value:
+  // anything made up only of digits came back as a Number.  A path or linkpath
+  // of '12345' is a perfectly ordinary file name, and handing it back as the
+  // Number 12345 breaks every string operation done on it downstream.
+  const parsed = Pax.parse(
+    '14 path=12345\n18 linkpath=54321\n13 WAT=12345\n15 ctime=12345\n',
+    null, false)
+
+  t.equal(parsed.path, '12345')
+  t.equal(typeof parsed.path, 'string', 'path is a string, not a number')
+  t.equal(parsed.linkpath, '54321')
+  t.equal(typeof parsed.linkpath, 'string', 'linkpath is a string, not a number')
+  t.same(parsed.ctime, new Date('1970-01-01T03:25:45.000Z'))
+  t.equal(parsed.atime, null)
+  t.equal(parsed.charset, null)
+  t.equal(parsed.comment, null)
+  t.equal(parsed.gid, null)
+  t.equal(parsed.gname, null)
+  t.equal(parsed.mtime, null)
+  t.equal(parsed.size, null)
+  t.equal(parsed.uid, null)
+  t.equal(parsed.uname, null)
+  t.equal(parsed.dev, null)
+  t.equal(parsed.ino, null)
+  t.equal(parsed.nlink, null)
+  t.equal(parsed.global, false)
+  t.equal(parsed.WAT, undefined, 'unknown keys are not picked up')
+
+  t.end()
+})
+
+t.test('each known field is read as the type it is defined to have', t => {
+  // Pax.parse merges the raw key/value set it parsed into the object handed to
+  // it as the second argument, so passing a bare object exposes the parse
+  // itself -- including the fields the Pax constructor does not keep.
+  const parseRaw = line => {
+    const raw = {}
+    Pax.parse(line, raw, false)
+    return raw
+  }
+
+  // the length prefix counts its own digits, so it has to be resolved against
+  // itself, exactly the way Pax#encodeField writes it
+  const paxLine = (k, v) => {
+    const s = ' ' + k + '=' + v + '\n'
+    const byteLen = Buffer.byteLength(s)
+    let digits = Math.floor(Math.log(byteLen) / Math.log(10)) + 1
+    if (byteLen + digits >= Math.pow(10, digits))
+      digits += 1
+    return (digits + byteLen) + s
+  }
+
+  // every value below is spelled so that guessing the type from its shape
+  // would get it wrong
+  const value = '12345'
+
+  const stringFields =
+    ['path', 'linkpath', 'type', 'charset', 'comment', 'gname', 'uname']
+  stringFields.forEach(k => {
+    const raw = parseRaw(paxLine(k, value))
+    t.equal(raw[k], value, k + ' keeps the value it was given')
+    t.equal(typeof raw[k], 'string', k + ' is a string')
+  })
+
+  const dateFields = ['atime', 'mtime', 'ctime']
+  dateFields.forEach(k => {
+    const raw = parseRaw(paxLine(k, value))
+    t.ok(raw[k] instanceof Date, k + ' is a Date')
+    t.equal(raw[k].getTime(), 12345000, k + ' is read as epoch seconds')
+  })
+
+  const numberFields = ['gid', 'uid', 'dev', 'ino', 'nlink', 'size', 'mode']
+  numberFields.forEach(k => {
+    const raw = parseRaw(paxLine(k, value))
+    t.equal(raw[k], 12345, k + ' keeps the value it was given')
+    t.equal(typeof raw[k], 'number', k + ' is a number')
+  })
+
+  // SCHILY.dev/ino/nlink are the spellings tar writes these three under
+  const schilyFields = ['dev', 'ino', 'nlink']
+  schilyFields.forEach(k => {
+    const raw = parseRaw(paxLine('SCHILY.' + k, value))
+    t.equal(raw[k], 12345, 'SCHILY.' + k + ' is read as ' + k)
+  })
+
+  // a key tar does not know about is dropped, rather than guessed at
+  const unknown = parseRaw(paxLine('WAT', value))
+  t.same(Object.keys(unknown), [], 'nothing is set for an unknown key')
+
+  t.end()
+})

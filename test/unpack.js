@@ -22,6 +22,7 @@ const mkdirp = require('mkdirp')
 const mutateFS = require('mutate-fs')
 const eos = require('end-of-stream')
 const ReadEntry = require('../lib/read-entry.js')
+const Pax = require('../lib/pax.js')
 
 t.teardown(_ => rimraf.sync(unpackdir))
 
@@ -4135,6 +4136,95 @@ t.test('CVE-2026-31802 rooted symlink linkpath escaping extraction dir', {
     })
     t.strictSame(warnings, [], 'no linkpath warnings')
     t.end()
+  })
+
+  t.end()
+})
+
+// CVE-2026-59871: the type of a pax header value used to be guessed from the
+// shape of the value, so a path made up only of digits -- '12345', a perfectly
+// ordinary file name -- came back as the Number 12345 instead of the string it
+// is.  Every field of the entry it overrides is then the wrong type, and the
+// unpacker does string work on it: the entry blows up on
+// `this.path.substr is not a function` and never reaches the disk at all.
+t.test('numeric pax/entry name discernment', t => {
+  const base = path.resolve(unpackdir, 'numeric-pax-name')
+  t.teardown(_ => rimraf.sync(base))
+
+  const numericName = '12345'
+  const alphaName = 'abcde'
+  const body = '12345\n'
+  const names = [numericName, alphaName]
+  const stricts = [true, false]
+
+  const setup = leg => {
+    const cwd = path.resolve(base, leg)
+    rimraf.sync(cwd)
+    mkdirp.sync(cwd)
+    return cwd
+  }
+
+  const tarData = (paxName, entryName) => makeTar([
+    new Pax({
+      path: paxName,
+      size: body.length
+    }, false).encode(),
+    {
+      type: 'File',
+      path: entryName,
+      mode: 0o755,
+      ctime: new Date('2000-01-01T00:00:00.000Z'),
+      mtime: new Date('2000-01-01T00:00:00.000Z'),
+      size: body.length
+    },
+    body,
+    '',
+    '',
+    // makeTar sizes the concatenation by the number of chunks it was handed,
+    // but an encoded pax header is two blocks from a single chunk -- one more
+    // chunk keeps both trailing EOF blocks from being clipped off the end
+    ''
+  ])
+
+  const check = (t, cwd, paxName) => {
+    t.equal(fs.readFileSync(path.resolve(cwd, paxName), 'utf8'), body,
+      'the pax path was used as the string it is')
+  }
+
+  stricts.forEach(strict => {
+    t.test('strict=' + strict, t => {
+      names.forEach(paxName => {
+        t.test('paxName=' + paxName, t => {
+          names.forEach(entryName => {
+            t.test('entryName=' + entryName, t => {
+              const data = tarData(paxName, entryName)
+              const leg = strict + '-' + paxName + '-' + entryName
+
+              t.test('sync', t => {
+                const cwd = setup(leg + '-sync')
+                new UnpackSync({ strict: strict, cwd: cwd }).end(data)
+                check(t, cwd, paxName)
+                t.end()
+              })
+
+              t.test('async', t => {
+                const cwd = setup(leg + '-async')
+                new Unpack({ strict: strict, cwd: cwd })
+                  .on('close', _ => {
+                    check(t, cwd, paxName)
+                    t.end()
+                  })
+                  .end(data)
+              })
+
+              t.end()
+            })
+          })
+          t.end()
+        })
+      })
+      t.end()
+    })
   })
 
   t.end()
