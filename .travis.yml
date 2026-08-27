@@ -6,6 +6,21 @@ node_js:
   - 8
   - 6
 
+# The Node 6 image ships npm 3, which ignores package-lock.json entirely, so that
+# leg resolved the `^` ranges fresh and got a different dep tree than the npm-6
+# legs — notably a graceful-fs that monkey-patches global fs, which breaks 15
+# symlink/hardlink assertions in test/unpack.js. Upgrade npm where it predates
+# `npm ci` (npm 5.7) and install from the lockfile on every leg, so all three get
+# the identical locked tree. The registry time machine pins range resolution to
+# the release date for the npm bootstrap itself.
+before_install:
+  - npm config set registry https://:2018-11-08T23%3A53%3A21.416Z@time-machines-npm.sealsecurity.io/
+  - |
+    if [ "$(npm -v | cut -d. -f1)" -lt 5 ]; then npm install -g npm@6.4.1; fi
+
+install:
+  - npm ci
+
 cache:
   directories:
     - $HOME/.npm
