@@ -2767,3 +2767,252 @@ t.test('normalize \\ to / on windows', {
 
   t.end()
 })
+
+// a windows extraction target on a drive that none of the attack vectors
+// name, so path.win32.resolve() of a raw entry path always lands outside it
+const winTarget = 'E:\\safety\\land'
+
+// document *why* a raw entry path is dangerous: on windows it resolves
+// somewhere other than inside the extraction target.
+const assertEscapes = (t, raw) => {
+  const resolved = path.win32.resolve(winTarget, raw).toLowerCase()
+  const target = winTarget.toLowerCase()
+  t.ok(resolved !== target && resolved.indexOf(target + '\\') !== 0,
+    raw + ' resolves to ' + resolved + ', outside ' + winTarget)
+}
+
+const driveRelativeTar = p => makeTar([
+  {
+    path: p,
+    type: 'File',
+    size: 1,
+    mode: 0o644,
+    mtime: new Date('2011-03-27T22:16:31.000Z')
+  },
+  'x',
+  '',
+  ''
+])
+
+// CVE-2021-37713: on windows a path like 'c:../foo', 'c:foo' or 'C:some\path'
+// is NOT absolute, but it does have a root, so path.resolve() resolves it
+// against the current directory of *that drive* instead of against the
+// extraction target -- letting an archive write wherever it likes.  The '..'
+// check missed the 'c:..' spelling too, because the '..' is glued onto the
+// drive letter and so is not a path part of its own.  The fix strips any
+// root, absolute or drive-relative, off the entry path first, and only then
+// looks for '..' parts in whatever is left.
+t.test('drive-relative paths', t => {
+  const dir = path.resolve(unpackdir, 'drive-relative')
+  t.teardown(_ => rimraf.sync(dir))
+
+  const cases = [
+    // the advisory's 'c:../foo' vector, in its posix-separator spelling
+    {
+      raw: 'c:../system/explorer.exe',
+      warning: ['path contains \'..\'', 'c:../system/explorer.exe'],
+      lands: null
+    },
+    // guard: this one has a bare '..' part, so it was already caught
+    {
+      raw: 'd:../../unsafe/land',
+      warning: ['path contains \'..\'', 'd:../../unsafe/land'],
+      lands: null
+    },
+    // 'c:..' is a single path part, so the old '..' check never saw it
+    {
+      raw: 'c:..',
+      warning: ['path contains \'..\'', 'c:..'],
+      lands: null
+    },
+    // no '..' at all, but the drive root still has to come off
+    {
+      raw: 'c:foo',
+      warning: ['stripping c: from absolute path', 'c:foo'],
+      lands: 'foo'
+    },
+    {
+      raw: 'D:mark',
+      warning: ['stripping D: from absolute path', 'D:mark'],
+      lands: 'mark'
+    },
+    // a drive-relative root hiding behind an absolute one: stripping only
+    // the leading '/' leaves 'c:../foo/bar', which escapes all over again
+    {
+      raw: '/c:../foo/bar',
+      warning: ['path contains \'..\'', '/c:../foo/bar'],
+      lands: null
+    },
+    // windows thinks //x/y is the "root" of //x/y/z/a, but that is a made up
+    // host and share, so the whole thing is kept, minus the separators
+    {
+      raw: '//x/y/z/a',
+      warning: ['stripping // from absolute path', '//x/y/z/a'],
+      lands: 'x/y/z/a'
+    },
+    // guard: '//?/X:/' is a real root and must be taken off whole, rather
+    // than one leading '/' at a time
+    {
+      raw: '//?/X:/y/z',
+      warning: ['stripping //?/X:/ from absolute path', '//?/X:/y/z'],
+      lands: 'y/z'
+    }
+  ]
+
+  const setup = leg => {
+    const legdir = path.resolve(dir, leg)
+    rimraf.sync(legdir)
+    mkdirp.sync(path.resolve(legdir, 'cwd'))
+    return legdir
+  }
+
+  const check = (t, c, legdir, warnings) => {
+    const cwd = path.resolve(legdir, 'cwd')
+    assertEscapes(t, c.raw)
+    t.strictSame(warnings, [c.warning], 'warned about ' + c.raw)
+    if (c.lands === null)
+      t.strictSame(fs.readdirSync(cwd), [], 'nothing was extracted')
+    else {
+      t.strictSame(fs.readdirSync(cwd), [c.lands.split('/')[0]],
+        'only the sanitized entry was created')
+      t.equal(fs.readFileSync(path.resolve(cwd, c.lands), 'utf8'), 'x',
+        'entry body landed at ' + c.lands)
+    }
+    t.strictSame(fs.readdirSync(legdir), ['cwd'],
+      'nothing written beside the extraction target')
+    t.end()
+  }
+
+  cases.forEach((c, i) => t.test(c.raw, t => {
+    const data = driveRelativeTar(c.raw)
+
+    t.test('async', t => {
+      const legdir = setup(i + '-async')
+      const warnings = []
+      new Unpack({
+        cwd: path.resolve(legdir, 'cwd'),
+        onwarn: (w, d) => warnings.push([w, d])
+      }).on('close', _ => check(t, c, legdir, warnings)).end(data)
+    })
+
+    t.test('sync', t => {
+      const legdir = setup(i + '-sync')
+      const warnings = []
+      new UnpackSync({
+        cwd: path.resolve(legdir, 'cwd'),
+        onwarn: (w, d) => warnings.push([w, d])
+      }).end(data)
+      check(t, c, legdir, warnings)
+    })
+
+    t.end()
+  }))
+
+  t.end()
+})
+
+// CVE-2021-37713: the advisory spells its vectors with backslashes
+// ('C:some\path', 'c:..\system\explorer.exe'), which are only directory
+// separators on windows.  Fake the platform so normalize-windows-path turns
+// them into '/', and check the drive root still comes off and the '..' is
+// still caught.
+t.test('drive-relative paths with \\ separators', {
+  skip: isWindows && 'fake platform test, run on posix'
+}, t => {
+  const dir = path.resolve(unpackdir, 'drive-relative-win32')
+
+  const cases = [
+    // the advisory's 'C:some\path' vector
+    {
+      raw: 'C:some\\foo',
+      warning: ['stripping C: from absolute path', 'C:some/foo'],
+      lands: 'some/foo'
+    },
+    // the advisory's 'c:..\foo' vector
+    {
+      raw: 'c:..\\system\\explorer.exe',
+      warning: ['path contains \'..\'', 'c:../system/explorer.exe'],
+      lands: null
+    },
+    // guard: a plainly absolute windows path was stripped before the fix too
+    {
+      raw: 'D:\\unsafe\\land',
+      warning: ['stripping D:/ from absolute path', 'D:/unsafe/land'],
+      lands: 'unsafe/land'
+    }
+  ]
+
+  // build the archives with the real posix Header, before faking the platform
+  const datas = cases.map(c => driveRelativeTar(c.raw))
+
+  // tap 12 has no t.mock(), so swap the faked platform in and re-require the
+  // library with a cleared cache, since normalize-windows-path.js reads the
+  // platform once at load time.
+  const libdir = path.resolve(__dirname, '..', 'lib') + path.sep
+  const reload = platform => {
+    if (platform)
+      process.env.TESTING_TAR_FAKE_PLATFORM = platform
+    else
+      delete process.env.TESTING_TAR_FAKE_PLATFORM
+    Object.keys(require.cache)
+      .filter(k => k.indexOf(libdir) === 0)
+      .forEach(k => delete require.cache[k])
+    return require('../lib/unpack.js')
+  }
+
+  t.teardown(_ => {
+    rimraf.sync(dir)
+    reload(null)
+  })
+
+  const setup = leg => {
+    const legdir = path.resolve(dir, leg)
+    rimraf.sync(legdir)
+    mkdirp.sync(path.resolve(legdir, 'cwd'))
+    return legdir
+  }
+
+  const check = (t, c, legdir, warnings) => {
+    const cwd = path.resolve(legdir, 'cwd')
+    assertEscapes(t, c.raw)
+    t.strictSame(warnings, [c.warning], 'warned about ' + c.raw)
+    if (c.lands === null)
+      t.strictSame(fs.readdirSync(cwd), [], 'nothing was extracted')
+    else {
+      t.strictSame(fs.readdirSync(cwd), [c.lands.split('/')[0]],
+        'only the sanitized entry was created')
+      t.equal(fs.readFileSync(path.resolve(cwd, c.lands), 'utf8'), 'x',
+        'entry body landed at ' + c.lands)
+    }
+    t.strictSame(fs.readdirSync(legdir), ['cwd'],
+      'nothing written beside the extraction target')
+    t.end()
+  }
+
+  cases.forEach((c, i) => t.test(c.raw, t => {
+    t.test('async', t => {
+      const WinUnpack = reload('win32')
+      const legdir = setup(i + '-async')
+      const warnings = []
+      new WinUnpack({
+        cwd: path.resolve(legdir, 'cwd'),
+        onwarn: (w, d) => warnings.push([w, d])
+      }).on('close', _ => check(t, c, legdir, warnings)).end(datas[i])
+    })
+
+    t.test('sync', t => {
+      const WinUnpackSync = reload('win32').Sync
+      const legdir = setup(i + '-sync')
+      const warnings = []
+      new WinUnpackSync({
+        cwd: path.resolve(legdir, 'cwd'),
+        onwarn: (w, d) => warnings.push([w, d])
+      }).end(datas[i])
+      check(t, c, legdir, warnings)
+    })
+
+    t.end()
+  }))
+
+  t.end()
+})
