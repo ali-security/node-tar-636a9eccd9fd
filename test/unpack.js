@@ -3016,3 +3016,257 @@ t.test('drive-relative paths with \\ separators', {
 
   t.end()
 })
+
+// 'café' spelled with a precomposed é, and with an e followed by a combining
+// acute accent.  Different bytes, different dirCache keys, but the same file
+// on any filesystem that normalizes unicode (and, like an 8.3 shortname on
+// windows, indistinguishable from the outside).
+const cafeNFC = Buffer.from([0x63, 0x61, 0x66, 0xc3, 0xa9]).toString()
+const cafeNFD = Buffer.from([0x63, 0x61, 0x66, 0x65, 0xcc, 0x81]).toString()
+
+// snapshot the dirCache the instant the symlink entry is handled.  This
+// listener is added after the one the Unpack constructor installs, so it runs
+// right after the entry has been pruned, before the entries that follow can
+// put the dropped keys back.
+const atSymlink = (unpack, dirCache) => {
+  const seen = {}
+  unpack.on('entry', entry => {
+    if (entry.type === 'SymbolicLink' && !seen.cache)
+      seen.cache = new Map(dirCache)
+  })
+  return seen
+}
+
+// CVE-2021-37712: a symlink whose name collides with a directory already in
+// the dirCache only once the filesystem squashes unicode normalization (or,
+// on windows, 8.3 shortnames) left that directory's key behind when the cache
+// was pruned, because the keys were compared byte for byte.  A later entry
+// under the directory name then hit the stale key, skipped mkdir()'s symlink
+// check, and was written straight through the link -- an arbitrary file write
+// outside the extraction target.  The fix drops the whole dirCache as soon as
+// any symlink is extracted, and compares the surviving keys on an
+// NFKD-normalized, case-folded form.  The escape itself is not reachable on a
+// case-sensitive, non-normalizing filesystem, where the two spellings are
+// simply two different names, so the dirCache is the assertion.
+t.test('dirCache dropped on unicode normalized symlink collision', {
+  skip: isWindows && 'symlinks not fully supported'
+}, t => {
+  const dir = path.resolve(unpackdir, 'dircache-unicode')
+  t.teardown(_ => rimraf.sync(dir))
+
+  const data = makeTar([
+    {
+      path: 'foo',
+      type: 'Directory',
+      mode: 0o755
+    },
+    {
+      path: 'foo/bar',
+      type: 'File',
+      size: 1,
+      mode: 0o644
+    },
+    'x',
+    {
+      path: cafeNFC,
+      type: 'Directory',
+      mode: 0o755
+    },
+    {
+      path: cafeNFD,
+      type: 'SymbolicLink',
+      linkpath: 'foo'
+    },
+    {
+      path: cafeNFC + '/bar',
+      type: 'File',
+      size: 1,
+      mode: 0o644
+    },
+    'y',
+    '',
+    ''
+  ])
+
+  const setup = leg => {
+    const cwd = path.resolve(dir, leg)
+    rimraf.sync(cwd)
+    mkdirp.sync(cwd)
+    return cwd
+  }
+
+  const check = (t, cwd, dirCache, seen) => {
+    t.notOk(seen.cache.has(cwd + '/' + cafeNFC),
+      'colliding dir key dropped when the symlink was extracted')
+    t.notOk(seen.cache.has(cwd + '/foo'),
+      'symlink target key dropped when the symlink was extracted')
+    t.notOk(dirCache.has(cwd + '/foo'),
+      'dropped key not put back by the entries that follow')
+    t.ok(fs.lstatSync(cwd + '/' + cafeNFD).isSymbolicLink(), 'entry is a symlink')
+    t.equal(fs.readFileSync(cwd + '/foo/bar', 'utf8'), 'x',
+      'nothing written through the symlink')
+    t.strictSame(fs.readdirSync(cwd + '/foo'), ['bar'],
+      'symlink target untouched')
+    t.end()
+  }
+
+  t.test('async', t => {
+    const cwd = setup('async')
+    const dirCache = new Map()
+    const u = new Unpack({ cwd: cwd, dirCache: dirCache })
+    const seen = atSymlink(u, dirCache)
+    u.on('close', _ => check(t, cwd, dirCache, seen)).end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = setup('sync')
+    const dirCache = new Map()
+    const u = new UnpackSync({ cwd: cwd, dirCache: dirCache })
+    const seen = atSymlink(u, dirCache)
+    u.end(data)
+    check(t, cwd, dirCache, seen)
+  })
+
+  t.end()
+})
+
+// CVE-2021-37712: there is no way to tell from the entry name alone whether a
+// symlink collides with something already in the dirCache -- that depends on
+// how the filesystem folds case, normalizes unicode, or hands out 8.3
+// shortnames.  So the drop cannot be conditional on the name resembling a
+// cached key: any symlink at all has to clear the entire cache.
+t.test('dirCache dropped for any symlink, not just colliding names', {
+  skip: isWindows && 'symlinks not fully supported'
+}, t => {
+  const dir = path.resolve(unpackdir, 'dircache-any-symlink')
+  t.teardown(_ => rimraf.sync(dir))
+
+  const data = makeTar([
+    {
+      path: 'foo',
+      type: 'Directory',
+      mode: 0o755
+    },
+    {
+      path: 'foo/bar',
+      type: 'File',
+      size: 1,
+      mode: 0o644
+    },
+    'x',
+    {
+      path: 'quux',
+      type: 'SymbolicLink',
+      linkpath: './elsewhere'
+    },
+    {
+      path: 'baz/qux',
+      type: 'File',
+      size: 1,
+      mode: 0o644
+    },
+    'z',
+    '',
+    ''
+  ])
+
+  const setup = leg => {
+    const cwd = path.resolve(dir, leg)
+    rimraf.sync(cwd)
+    mkdirp.sync(cwd)
+    return cwd
+  }
+
+  const check = (t, cwd, dirCache, seen) => {
+    t.notOk(seen.cache.has(cwd + '/foo'),
+      'unrelated symlink still dropped the whole dirCache')
+    t.notOk(dirCache.has(cwd + '/foo'),
+      'dropped key not put back by the entries that follow')
+    t.ok(fs.lstatSync(cwd + '/quux').isSymbolicLink(), 'entry is a symlink')
+    t.equal(fs.readFileSync(cwd + '/foo/bar', 'utf8'), 'x',
+      'earlier entry still landed')
+    t.equal(fs.readFileSync(cwd + '/baz/qux', 'utf8'), 'z',
+      'later entry still landed')
+    t.end()
+  }
+
+  t.test('async', t => {
+    const cwd = setup('async')
+    const dirCache = new Map()
+    const u = new Unpack({ cwd: cwd, dirCache: dirCache })
+    const seen = atSymlink(u, dirCache)
+    u.on('close', _ => check(t, cwd, dirCache, seen)).end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = setup('sync')
+    const dirCache = new Map()
+    const u = new UnpackSync({ cwd: cwd, dirCache: dirCache })
+    const seen = atSymlink(u, dirCache)
+    u.end(data)
+    check(t, cwd, dirCache, seen)
+  })
+
+  t.end()
+})
+
+// CVE-2021-37712: pruning the dirCache for an entry that is no longer a
+// directory compared the keys case-insensitively, but two unicode spellings
+// of the same name still failed to match each other, leaving stale keys for
+// the directory and everything under it.  Keys are now compared on their
+// NFKD-normalized, case-folded form.
+t.test('prune dirCache on unicode-normalized match', t => {
+  const dir = path.resolve(unpackdir, 'dircache-nfkd')
+  t.teardown(_ => rimraf.sync(dir))
+
+  const data = makeTar([
+    {
+      path: cafeNFC + '/bar',
+      type: 'Directory',
+      mode: 0o755
+    },
+    {
+      path: cafeNFD,
+      type: 'File',
+      size: 1,
+      mode: 0o644
+    },
+    'x',
+    '',
+    ''
+  ])
+
+  const setup = leg => {
+    const cwd = path.resolve(dir, leg)
+    rimraf.sync(cwd)
+    mkdirp.sync(cwd)
+    return cwd
+  }
+
+  const check = (t, cwd, dirCache) => {
+    t.notOk(dirCache.has(cwd + '/' + cafeNFC),
+      'stale dir key pruned across unicode normalization')
+    t.notOk(dirCache.has(cwd + '/' + cafeNFC + '/bar'),
+      'stale child key pruned across unicode normalization')
+    t.equal(fs.readFileSync(cwd + '/' + cafeNFD, 'utf8'), 'x',
+      'entry body landed')
+    t.end()
+  }
+
+  t.test('async', t => {
+    const cwd = setup('async')
+    const dirCache = new Map()
+    new Unpack({ cwd: cwd, dirCache: dirCache })
+      .on('close', _ => check(t, cwd, dirCache))
+      .end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = setup('sync')
+    const dirCache = new Map()
+    new UnpackSync({ cwd: cwd, dirCache: dirCache }).end(data)
+    check(t, cwd, dirCache)
+  })
+
+  t.end()
+})
