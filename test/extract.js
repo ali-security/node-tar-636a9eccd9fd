@@ -375,3 +375,92 @@ t.test('max decompression ratio', t => {
     t.end()
   })
 })
+
+// GHSA-r292-9mhp-454m: a crafted GNU 'L' or PAX 'x' long-path header can hand
+// the parser an entry path made of thousands of segments.  When a file list is
+// in play, the filter installed by filesFilter() walks that path upward one
+// path.dirname() at a time, so an unbounded walk dies of a RangeError deep
+// inside Parser[CONSUMEHEADER] -- before Unpack[CHECKPATH] ever sees the entry.
+// The filter is exactly the closure filesFilter() installs, so calling it
+// directly reaches the recursion without having to smuggle a deep path through
+// a tar header (which cannot carry one, see the next test).
+t.test('deeply nested entry path does not overflow the stack', t => {
+  const deepPath = new Array(20000).join('a/') + 'a'
+  t.equal(deepPath.split('/').length, 20000, '20000 path segments')
+
+  t.test('no filter function', t => {
+    const u = x({}, ['some/other/path'])
+    t.equal(typeof u.filter, 'function', 'the file list installed a filter')
+    let threw = null
+    let ret = null
+    try {
+      ret = u.filter(deepPath, {})
+    } catch (er) {
+      threw = er
+    }
+    t.equal(threw, null, 'no RangeError escaped the filter')
+    t.equal(ret, false, 'deeply nested entry is not selected')
+    t.end()
+  })
+
+  t.test('filter function', t => {
+    const u = x({ filter: _ => true }, ['some/other/path'])
+    let threw = null
+    let ret = null
+    try {
+      ret = u.filter(deepPath, {})
+    } catch (er) {
+      threw = er
+    }
+    t.equal(threw, null, 'no RangeError escaped the filter')
+    t.equal(ret, false, 'deeply nested entry is not selected')
+    t.end()
+  })
+
+  t.end()
+})
+
+t.test('nested but sane paths are still extracted', t => {
+  // 45 segments is deep enough to exercise the upward walk and shallow enough
+  // that a tar header can actually carry the path: Header.encode() silently
+  // truncates anything that fits neither the 100 byte name field nor the 155
+  // byte prefix, so assert what lands on disk rather than trusting it.
+  const deepPath = new Array(45).join('a/') + 'a'
+  t.equal(deepPath.split('/').length, 45, '45 path segments')
+  t.ok(deepPath.length < 100, 'fits in the header path field')
+
+  const dir = path.resolve(extractdir, 'deep-path')
+  const data = makeTar([
+    { path: deepPath, type: 'File', size: 0 },
+    '',
+    ''
+  ])
+
+  t.beforeEach(cb => {
+    rimraf.sync(dir)
+    mkdirp.sync(dir)
+    cb()
+  })
+
+  t.test('exact match', t => {
+    const u = x({ cwd: dir }, [deepPath])
+    u.on('close', _ => {
+      t.ok(fs.lstatSync(path.resolve(dir, deepPath)).isFile(),
+        'extracted, and the path was not truncated')
+      t.end()
+    })
+    u.end(data)
+  })
+
+  t.test('matched through an ancestor in the list', t => {
+    const u = x({ cwd: dir }, ['a'])
+    u.on('close', _ => {
+      t.ok(fs.lstatSync(path.resolve(dir, deepPath)).isFile(),
+        'extracted by walking up to the listed root')
+      t.end()
+    })
+    u.end(data)
+  })
+
+  t.end()
+})
